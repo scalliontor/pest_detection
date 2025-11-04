@@ -49,15 +49,46 @@ def get_color(track_id):
     return COLORS[track_id % len(COLORS)]
 
 # ORB-based stabilizer setup
-ORB_FEATURES = 2000
-MATCH_RATIO = 0.6  # Lowe's ratio test
-RANSAC_THRESH = 4.0
-SMOOTH_ALPHA = 0.9  # blend previous transform for smoothing
+ORB_FEATURES = 1000
+MATCH_RATIO = 0.4  # Lowe's ratio test
+RANSAC_THRESH = 10.0
+SMOOTH_ALPHA = 0.3  # blend previous transform for smoothing
+STAB_WINDOW = 16  # frames for global smoothing window
 orb = cv2.ORB_create(nfeatures=ORB_FEATURES)
 bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 prev_kp, prev_des = None, None
 last_M = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+
+# Stabilization trajectory state (cumulative path)
+cum_x = 0.0
+cum_y = 0.0
+cum_a = 0.0
+traj_x = []
+traj_y = []
+traj_a = []
 print("Stabilizer: ORB")
+
+def _smooth_tail_poly(vals, window, degree=2):
+    """
+    Fit a degree-k polynomial to the last `window` samples and return the
+    optimized value at the tail (Savitzky–Golay style smoothing).
+    Falls back to mean if not enough points or on numerical issues.
+    """
+    n = len(vals)
+    if n == 0:
+        return 0.0
+    w = min(window, n)
+    seg = np.asarray(vals[-w:], dtype=np.float32)
+    if w <= degree:
+        return float(np.mean(seg))
+    x = np.arange(w, dtype=np.float32)
+    try:
+        coeffs = np.polyfit(x, seg, deg=degree)
+        x_last = w - 1
+        y_fit = np.polyval(coeffs, x_last)
+        return float(y_fit)
+    except Exception:
+        return float(np.mean(seg))
 
 print("Processing video with SORT tracker...")
 start_time = time.time()
@@ -73,6 +104,8 @@ while True:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     kp, des = orb.detectAndCompute(gray, None)
 
+    # Estimate inter-frame motion and update global smoothed stabilization
+    dx = dy = da = 0.0
     if (
         prev_kp is not None and prev_des is not None and
         kp is not None and des is not None and
@@ -88,13 +121,33 @@ while True:
             dst_pts = np.float32([kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
             M_est, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=RANSAC_THRESH)
             if M_est is not None:
-                # Invert transform to map current -> previous coordinate frame
-                M_inv = cv2.invertAffineTransform(M_est).astype(np.float32)
-                # Smooth warp transform in inverse space
-                M_warp = (SMOOTH_ALPHA * last_M + (1.0 - SMOOTH_ALPHA) * M_inv).astype(np.float32)
-                frame = cv2.warpAffine(frame, M_warp, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-                gray = cv2.warpAffine(gray, M_warp, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE)
-                last_M = M_warp
+                # decompose incremental motion
+                dx = float(M_est[0, 2])
+                dy = float(M_est[1, 2])
+                da = float(np.arctan2(M_est[1, 0], M_est[0, 0]))
+
+    # Update cumulative trajectory
+    cum_x += dx
+    cum_y += dy
+    cum_a += da
+    traj_x.append(cum_x)
+    traj_y.append(cum_y)
+    traj_a.append(cum_a)
+
+    # Global optimization over last STAB_WINDOW frames via poly fit
+    x_smooth = _smooth_tail_poly(traj_x, STAB_WINDOW, degree=2)
+    y_smooth = _smooth_tail_poly(traj_y, STAB_WINDOW, degree=2)
+    a_smooth = _smooth_tail_poly(traj_a, STAB_WINDOW, degree=2)
+
+    # Compute correction to apply this frame
+    diff_x = x_smooth - cum_x
+    diff_y = y_smooth - cum_y
+    diff_a = a_smooth - cum_a
+    ca = np.cos(diff_a)
+    sa = np.sin(diff_a)
+    M_corr = np.array([[ca, -sa, diff_x], [sa, ca, diff_y]], dtype=np.float32)
+    frame = cv2.warpAffine(frame, M_corr, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    gray = cv2.warpAffine(gray, M_corr, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REPLICATE)
     # Update previous features
     prev_kp, prev_des = kp, des
 
